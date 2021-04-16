@@ -262,6 +262,7 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 
 	if (argc >= 4) {
 
+		// FIXME: just for debugging
 		if ((ret = sqlite3_create_function_v2(vtab->db, argv[4],
 		 	vtab->num_inputs, SQLITE_UTF8, NULL, NULL, NULL, NULL, NULL)) != SQLITE_OK)
 			 goto sqlite_error;
@@ -370,6 +371,7 @@ static int statement_vtab_best_index(sqlite3_vtab* pVTab, sqlite3_index_info* in
 	index_info->orderByConsumed = 0;
 	index_info->estimatedCost = 1;
 	index_info->estimatedRows = 1;
+
 	int col_max = 0;
 	sqlite3_uint64 used_cols = 0;
 	for(int i = 0; i < index_info->nConstraint; i++) {
