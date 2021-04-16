@@ -183,7 +183,12 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 	sqlite3_mutex_leave(mutex);
 
 	sqlite3_free(create);
+	
+	create = NULL;
+
 	sqlite3_finalize(stmt);
+
+	stmt = NULL;
 
 	char* select_expr = NULL;
 
@@ -217,6 +222,8 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 		sqlite3_mutex_leave(mutex);
 
 		sqlite3_free(select_expr);
+
+		select_expr = NULL;
 
 		sqlite3_mutex_enter(mutex);
 		if ((ret = sqlite3_create_function_v2(
