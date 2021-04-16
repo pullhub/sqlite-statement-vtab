@@ -11,6 +11,13 @@ SQLITE_EXTENSION_INIT1
 #include <stdio.h>
 #include <assert.h>
 
+struct statement_vtab;
+
+struct scalar_context {
+	sqlite3_stmt* stmt;
+	struct statement_vtab* vtab;
+};
+
 struct statement_vtab {
 	sqlite3_vtab base;
 	sqlite3* db;
@@ -18,6 +25,8 @@ struct statement_vtab {
 	size_t sql_len;
 	int num_inputs;
 	int num_outputs;
+	char* scalar_name;
+	struct scalar_context* scalar_ctx;
 };
 
 struct statement_cursor {
@@ -27,6 +36,48 @@ struct statement_cursor {
 	int param_argc;
 	sqlite3_value** param_argv;
 };
+
+static void scalar_call(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+	
+	int ret = SQLITE_OK;
+
+	struct scalar_context const* const stmt_ref = sqlite3_user_data(ctx);
+
+	sqlite3_stmt* const stmt = stmt_ref->stmt;
+
+	if (!stmt) {
+		// Called after module destroyed.
+		sqlite3_result_error_code(ctx, SQLITE_MISUSE);
+	}
+
+	for (int i = 0; i < argc; i++)
+		if ((ret = sqlite3_bind_value(stmt, i + 1, argv[i])) != SQLITE_OK)
+			goto end;
+	if ((ret = sqlite3_step(stmt)) != SQLITE_ROW) {
+		if (ret == SQLITE_DONE)
+			ret = SQLITE_MISUSE;
+		goto end;
+	}
+
+	sqlite3_result_value(ctx, sqlite3_column_value(stmt, 0));
+	sqlite3_reset(stmt);
+
+end:
+	if (ret != SQLITE_ROW)
+		sqlite3_result_error_code(ctx, ret);
+
+}
+
+static void scalar_destroy(void *ctx) {
+	struct scalar_context* context = (struct scalar_context*)ctx;
+	
+	if (context->vtab)
+		context->vtab->scalar_ctx = NULL;
+
+	sqlite3_finalize(context->stmt);
+	sqlite3_free(context);
+
+}
 
 static char* build_create_statement(sqlite3_stmt* stmt) {
 	sqlite3_str* sql = sqlite3_str_new(NULL);
@@ -53,8 +104,27 @@ static char* build_create_statement(sqlite3_stmt* stmt) {
 }
 
 static int statement_vtab_destroy(sqlite3_vtab* pVTab){
-	sqlite3_free(((struct statement_vtab*)pVTab)->sql);
+
+	struct statement_vtab* vtab = (struct statement_vtab*)pVTab;
+
+	int ret = SQLITE_OK;
+
+	if (vtab->scalar_ctx) {
+
+		// NOTE(bh): Sadly this results in SQLITE_BUSY, so workaround...
+		// ret = sqlite3_create_function_v2(vtab->db, vtab->scalar_name,
+		// 	vtab->num_inputs, SQLITE_UTF8, NULL, NULL, NULL, NULL, NULL);
+
+		ret = sqlite3_finalize(vtab->scalar_ctx->stmt);
+		vtab->scalar_ctx->stmt = NULL;
+		vtab->scalar_ctx->vtab = NULL;
+
+	}
+
+	sqlite3_free(vtab->scalar_name);
+	sqlite3_free(vtab->sql);
 	sqlite3_free(pVTab);
+
 	return SQLITE_OK;
 }
 
@@ -114,6 +184,54 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 
 	sqlite3_free(create);
 	sqlite3_finalize(stmt);
+
+	char* select_expr = NULL;
+
+	if (argc >= 4) {
+
+		// CREATE MODULE x USING statement((SELECT expr), name) creates a
+		// scalar valued function `name`.
+
+		if(!(select_expr = sqlite3_mprintf("SELECT (%s)",vtab->sql))) {
+			ret = SQLITE_NOMEM;
+			goto error;
+		}
+
+		if (!(vtab->scalar_ctx = sqlite3_malloc64(sizeof(*vtab->scalar_ctx)))) {
+			ret = SQLITE_NOMEM;
+			goto error;
+
+		}
+		// The prepared statement is owned by the vtab because the scalar
+		// function cannot finalize it itself. But the vtab cannot remove
+		// the function when the vtab is destroyed. So this is to let the
+		// scalar function know that the vtab is gone, and let the vtab
+		// know when the scalar function was removed from the outside.
+		vtab->scalar_ctx->vtab = vtab;
+		vtab->scalar_ctx->stmt = NULL;
+
+		sqlite3_mutex_enter(mutex);
+		if((ret = sqlite3_prepare_v2(db,select_expr,-1,&vtab->scalar_ctx->stmt,NULL)) != SQLITE_OK)
+			goto sqlite_error;
+
+		sqlite3_mutex_leave(mutex);
+
+		sqlite3_free(select_expr);
+
+		sqlite3_mutex_enter(mutex);
+		if ((ret = sqlite3_create_function_v2(
+						db, argv[4], vtab->num_inputs, SQLITE_UTF8,
+						vtab->scalar_ctx, scalar_call, NULL, NULL, scalar_destroy)) != SQLITE_OK)
+			goto sqlite_error;
+		sqlite3_mutex_leave(mutex);
+
+		if(!(vtab->scalar_name = sqlite3_mprintf("%s",argv[4]))) {
+			ret = SQLITE_NOMEM;
+			goto error;
+		}
+
+	}
+
 	return SQLITE_OK;
 
 sqlite_error:
@@ -121,6 +239,7 @@ sqlite_error:
 		ret = SQLITE_NOMEM;
 	sqlite3_mutex_leave(mutex);
 error:
+	sqlite3_free(select_expr);
 	sqlite3_free(create);
 	sqlite3_finalize(stmt);
 	statement_vtab_destroy(*ppVtab);
