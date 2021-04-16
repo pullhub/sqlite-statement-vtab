@@ -190,9 +190,12 @@ static int statement_vtab_destroy(sqlite3_vtab* pVTab){
 
 	if (vtab->scalar_ctx) {
 
-		// NOTE(bh): Sadly this results in SQLITE_BUSY, so workaround...
-		// ret = sqlite3_create_function_v2(vtab->db, scalar_name,
-		// 	vtab->num_inputs, SQLITE_UTF8, NULL, NULL, NULL, NULL, NULL);
+		sqlite3_log(
+			SQLITE_WARNING,
+			"%s:%u statement vtab cannot remove scalar function it created due to SQLite limitations",
+			__FUNCTION__,
+			__LINE__
+		);
 
 		ret = sqlite3_finalize(vtab->scalar_stmt);
 		vtab->scalar_stmt = NULL;
