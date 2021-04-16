@@ -14,7 +14,7 @@ SQLITE_EXTENSION_INIT1
 struct statement_vtab;
 
 struct scalar_context {
-	sqlite3_stmt* stmt;
+	char* sql;
 	struct statement_vtab* vtab;
 };
 
@@ -25,8 +25,8 @@ struct statement_vtab {
 	size_t sql_len;
 	int num_inputs;
 	int num_outputs;
-	char* scalar_name;
 	struct scalar_context* scalar_ctx;
+	sqlite3_stmt* scalar_stmt;
 };
 
 struct statement_cursor {
@@ -41,13 +41,24 @@ static void scalar_call(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 	
 	int ret = SQLITE_OK;
 
-	struct scalar_context const* const stmt_ref = sqlite3_user_data(ctx);
+	struct scalar_context const* const scalar_ctx = sqlite3_user_data(ctx);
 
-	sqlite3_stmt* const stmt = stmt_ref->stmt;
+	sqlite3_stmt* stmt = scalar_ctx->vtab ? scalar_ctx->vtab->scalar_stmt : NULL;
 
 	if (!stmt) {
+
 		// Called after module destroyed.
+		sqlite3_log(
+			SQLITE_WARNING,
+			"%s:%u scalar function called after its virtual table was removed (slow)",
+			__FUNCTION__,
+			__LINE__
+		);
+
+		// TODO: prepare the statement each call
+
 		sqlite3_result_error_code(ctx, SQLITE_MISUSE);
+		return;
 	}
 
 	for (int i = 0; i < argc; i++)
@@ -71,13 +82,81 @@ end:
 static void scalar_destroy(void *ctx) {
 	struct scalar_context* context = (struct scalar_context*)ctx;
 	
-	if (context->vtab)
+	if (context->vtab) {
+		sqlite3_finalize(context->vtab->scalar_stmt);
 		context->vtab->scalar_ctx = NULL;
+	}
 
-	sqlite3_finalize(context->stmt);
+	sqlite3_free(context->sql);
 	sqlite3_free(context);
 
 }
+
+static int scalar_attach(char const* const name, struct statement_vtab* const vtab) {
+
+	int ret = SQLITE_OK;
+
+	sqlite3_mutex* mutex = sqlite3_db_mutex(vtab->db);
+
+	// FIXME: what happens when ...
+
+	// CREATE MODULE x USING statement((SELECT expr), name) creates a
+	// scalar valued function `name`.
+
+	if (!(vtab->scalar_ctx = sqlite3_malloc64(sizeof(*vtab->scalar_ctx)))) {
+		ret = SQLITE_NOMEM;
+		goto error;
+	}
+
+	memset(vtab->scalar_ctx,0,sizeof(*vtab->scalar_ctx));
+
+	if(!(vtab->scalar_ctx->sql = sqlite3_mprintf("SELECT (%s)",vtab->sql))) {
+		ret = SQLITE_NOMEM;
+		goto error;
+	}
+
+	// The prepared statement is owned by the vtab because the scalar
+	// function cannot finalize it itself. But the vtab cannot remove
+	// the function when the vtab is destroyed. So this is to let the
+	// scalar function know that the vtab is gone, and let the vtab
+	// know when the scalar function was removed from the outside.
+	vtab->scalar_ctx->vtab = vtab;
+
+	sqlite3_mutex_enter(mutex);
+	if((ret = sqlite3_prepare_v2(vtab->db,vtab->scalar_ctx->sql,-1,&vtab->scalar_stmt,NULL)) != SQLITE_OK)
+		goto sqlite_error;
+	sqlite3_mutex_leave(mutex);
+
+	sqlite3_mutex_enter(mutex);
+	if ((ret = sqlite3_create_function_v2(
+					vtab->db, name, vtab->num_inputs, SQLITE_UTF8,
+					vtab->scalar_ctx, scalar_call, NULL, NULL, scalar_destroy)) != SQLITE_OK)
+		goto sqlite_error;
+	sqlite3_mutex_leave(mutex);
+
+	return SQLITE_OK;
+
+sqlite_error:
+
+	sqlite3_mutex_leave(mutex);
+
+error:
+
+	if (vtab->scalar_ctx) {
+		sqlite3_free(vtab->scalar_ctx->sql);
+		sqlite3_free(vtab->scalar_ctx);
+		vtab->scalar_ctx = NULL;
+	}
+
+	if (vtab->scalar_stmt) {
+		sqlite3_finalize(vtab->scalar_stmt);
+		vtab->scalar_stmt = NULL;
+	}
+
+	return ret;
+
+}
+
 
 static char* build_create_statement(sqlite3_stmt* stmt) {
 	sqlite3_str* sql = sqlite3_str_new(NULL);
@@ -112,16 +191,15 @@ static int statement_vtab_destroy(sqlite3_vtab* pVTab){
 	if (vtab->scalar_ctx) {
 
 		// NOTE(bh): Sadly this results in SQLITE_BUSY, so workaround...
-		// ret = sqlite3_create_function_v2(vtab->db, vtab->scalar_name,
+		// ret = sqlite3_create_function_v2(vtab->db, scalar_name,
 		// 	vtab->num_inputs, SQLITE_UTF8, NULL, NULL, NULL, NULL, NULL);
 
-		ret = sqlite3_finalize(vtab->scalar_ctx->stmt);
-		vtab->scalar_ctx->stmt = NULL;
+		ret = sqlite3_finalize(vtab->scalar_stmt);
+		vtab->scalar_stmt = NULL;
 		vtab->scalar_ctx->vtab = NULL;
 
 	}
 
-	sqlite3_free(vtab->scalar_name);
 	sqlite3_free(vtab->sql);
 	sqlite3_free(pVTab);
 
@@ -182,62 +260,18 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 		goto sqlite_error;
 	sqlite3_mutex_leave(mutex);
 
-	sqlite3_free(create);
-	
-	create = NULL;
-
-	sqlite3_finalize(stmt);
-
-	stmt = NULL;
-
-	char* select_expr = NULL;
-
 	if (argc >= 4) {
 
-		// CREATE MODULE x USING statement((SELECT expr), name) creates a
-		// scalar valued function `name`.
+		if ((ret = sqlite3_create_function_v2(vtab->db, argv[4],
+		 	vtab->num_inputs, SQLITE_UTF8, NULL, NULL, NULL, NULL, NULL)) != SQLITE_OK)
+			 goto sqlite_error;
 
-		if(!(select_expr = sqlite3_mprintf("SELECT (%s)",vtab->sql))) {
-			ret = SQLITE_NOMEM;
-			goto error;
-		}
-
-		if (!(vtab->scalar_ctx = sqlite3_malloc64(sizeof(*vtab->scalar_ctx)))) {
-			ret = SQLITE_NOMEM;
-			goto error;
-
-		}
-		// The prepared statement is owned by the vtab because the scalar
-		// function cannot finalize it itself. But the vtab cannot remove
-		// the function when the vtab is destroyed. So this is to let the
-		// scalar function know that the vtab is gone, and let the vtab
-		// know when the scalar function was removed from the outside.
-		vtab->scalar_ctx->vtab = vtab;
-		vtab->scalar_ctx->stmt = NULL;
-
-		sqlite3_mutex_enter(mutex);
-		if((ret = sqlite3_prepare_v2(db,select_expr,-1,&vtab->scalar_ctx->stmt,NULL)) != SQLITE_OK)
+		if ((ret = scalar_attach(argv[4], vtab)) != SQLITE_OK)
 			goto sqlite_error;
-
-		sqlite3_mutex_leave(mutex);
-
-		sqlite3_free(select_expr);
-
-		select_expr = NULL;
-
-		sqlite3_mutex_enter(mutex);
-		if ((ret = sqlite3_create_function_v2(
-						db, argv[4], vtab->num_inputs, SQLITE_UTF8,
-						vtab->scalar_ctx, scalar_call, NULL, NULL, scalar_destroy)) != SQLITE_OK)
-			goto sqlite_error;
-		sqlite3_mutex_leave(mutex);
-
-		if(!(vtab->scalar_name = sqlite3_mprintf("%s",argv[4]))) {
-			ret = SQLITE_NOMEM;
-			goto error;
-		}
-
 	}
+
+	sqlite3_free(create);
+	sqlite3_finalize(stmt);
 
 	return SQLITE_OK;
 
@@ -246,7 +280,6 @@ sqlite_error:
 		ret = SQLITE_NOMEM;
 	sqlite3_mutex_leave(mutex);
 error:
-	sqlite3_free(select_expr);
 	sqlite3_free(create);
 	sqlite3_finalize(stmt);
 	statement_vtab_destroy(*ppVtab);
